@@ -112,7 +112,6 @@
     rooms: [],
     roomState: null,
     countdownEndsAt: null,
-    countdownLocalEndsAt: null,
     peers: {},
     worldSeed: null,
     gameMode: 'single',
@@ -120,6 +119,9 @@
     lastSnapshotAt: 0,
     pendingSnapshot: null,
     lastServerHp: null,
+    spectating: false,
+    spectateTargetId: null,
+    selfAlive: true,
   };
   window.deadtownOnline = online;
 
@@ -166,7 +168,9 @@
     online.lastSnapshotAt = 0;
     online.pendingSnapshot = null;
     online.lastServerHp = null;
-    online.countdownLocalEndsAt = null;
+    online.spectating = false;
+    online.spectateTargetId = null;
+    online.selfAlive = true;
     if(!keepConnection){
       online.connected = false;
       online.connecting = false;
@@ -240,19 +244,52 @@
     return '';
   }
 
+
+  function onlineAlivePeers(){
+    return Object.values(online.peers).filter(p=>p && p.alive && (p.hp||0)>0);
+  }
+
+  function onlinePickSpectateTarget(){
+    if(!online.spectating){ online.spectateTargetId = null; return; }
+    const alivePeers = onlineAlivePeers();
+    if(!alivePeers.length){ online.spectateTargetId = null; return; }
+    if(online.spectateTargetId && online.peers[online.spectateTargetId]?.alive && (online.peers[online.spectateTargetId]?.hp||0)>0) return;
+    online.spectateTargetId = alivePeers[0].id;
+  }
+
+  function onlineSpectateTarget(){
+    if(!online.spectating) return null;
+    onlinePickSpectateTarget();
+    return online.spectateTargetId ? (online.peers[online.spectateTargetId] || null) : null;
+  }
+
+  function onlineSetSpectating(next){
+    online.spectating = !!next;
+    if(!online.spectating){
+      online.spectateTargetId = null;
+      online.selfAlive = true;
+      updateCursorVisibility();
+      return;
+    }
+    state.paused = false;
+    mouseDown = false;
+    onlinePickSpectateTarget();
+    updateCursorVisibility();
+  }
+
   function applySelfFromServer(self){
     if(!self) return;
     const prevHp = online.lastServerHp == null ? player.hp : online.lastServerHp;
+    const wasAlive = online.selfAlive !== false;
+    online.selfAlive = !!self.alive && (self.hp||0) > 0;
     const dx = self.x - player.x;
     const dy = self.y - player.y;
-    const drift = Math.hypot(dx,dy);
-    if(drift > 96 || !state.running){
+    if(Math.hypot(dx,dy) > 24 || !state.running){
       player.x = self.x;
       player.y = self.y;
     }else{
-      const correction = self.moving ? 0.08 : 0.3;
-      player.x += dx * correction;
-      player.y += dy * correction;
+      player.x += dx * 0.55;
+      player.y += dy * 0.55;
     }
     player.hp = self.hp;
     player.maxHp = self.maxHp;
@@ -277,10 +314,13 @@
       state.buffAnnouncement = mapBuffAnnouncement(self.buffAnnouncement);
       state.buffAnnouncementTimer = self.buffAnnouncementTimer;
     }
-    online.lastServerHp = self.hp;
-    if(self.hp <= 0 && !state.gameOver){
-      endGame();
+    if(wasAlive && !online.selfAlive){
+      pushOnlineNotice(lang==='zh' ? '你已倒下，正在观战队友。' : 'You are down. Spectating your teammate.', 'warn', 2600);
+      onlineSetSpectating(true);
+    } else if(!wasAlive && online.selfAlive){
+      onlineSetSpectating(false);
     }
+    online.lastServerHp = self.hp;
   }
 
   function onlineApplySnapshot(msg){
@@ -296,6 +336,7 @@
       nextPeers[p.id] = Object.assign({}, p, { lastSeen: performance.now() });
     }
     online.peers = nextPeers;
+    onlinePickSpectateTarget();
     if(self) applySelfFromServer(self);
     const match = msg.match || {};
     state.wave = match.wave ?? state.wave;
@@ -323,8 +364,6 @@
       online.roomState = msg.room || null;
       online.roomId = online.roomState?.roomId || null;
       online.countdownEndsAt = online.roomState?.countdownEndsAt || null;
-      const countdownMsLeft = Number(online.roomState?.countdownMsLeft);
-      online.countdownLocalEndsAt = Number.isFinite(countdownMsLeft) && countdownMsLeft > 0 ? (Date.now() + countdownMsLeft) : null;
       if(state.overlayScreen === 'online-lobby' || state.overlayScreen === 'online-room') renderOnlineRoom();
       return;
     }
@@ -335,7 +374,6 @@
       online.started = false;
       online.worldSeed = null;
       online.countdownEndsAt = null;
-      online.countdownLocalEndsAt = null;
       renderOnlineLobby();
       return;
     }
@@ -344,6 +382,7 @@
       online.roomId = online.roomState?.roomId || online.roomId;
       online.started = true;
       online.gameMode = 'online';
+      onlineSetSpectating(false);
       online.worldSeed = Number.isInteger(msg.worldSeed) ? msg.worldSeed : 12345;
       pushOnlineNotice(ot().onlineStartInfo, 'info');
       resetGame();
@@ -362,7 +401,6 @@
       online.started = false;
       online.worldSeed = null;
       online.countdownEndsAt = null;
-      online.countdownLocalEndsAt = null;
       online.gameMode = 'single';
       const rawMessage = String(msg.message || '');
       const hostNameMatch = rawMessage.match(/^(.*?)\s(?:disconnected\.|closed the room\.)/i);
@@ -383,6 +421,13 @@
       pushOnlineNotice(leaveText, 'info');
       return;
     }
+    if(msg.type === 'player_down'){
+      if(msg.playerId && msg.playerId !== online.clientId){
+        const playerLabel = msg.name || (lang==='zh' ? '队友' : 'A teammate');
+        pushOnlineNotice(lang==='zh' ? `${playerLabel} 已倒下。` : `${playerLabel} is down.`, 'warn', 2200);
+      }
+      return;
+    }
     if(msg.type === 'snapshot'){
       onlineApplySnapshot(msg);
       return;
@@ -390,6 +435,7 @@
     if(msg.type === 'match_over'){
       pushOnlineNotice(msg.message || ot().onlineMatchEnded, 'warn');
       online.started = false;
+      onlineSetSpectating(false);
       online.gameMode = 'single';
       goToMainMenu();
       return;
@@ -464,20 +510,19 @@
     const me = (room.players||[]).find(p=>p.id===online.clientId) || null;
     const meReady = !!me?.ready;
     const isHost = online.clientId === room.hostId;
-    const countdownSource = online.countdownLocalEndsAt || room.countdownEndsAt || null;
-    const countdownLeft = countdownSource ? Math.max(0, Math.ceil((countdownSource - Date.now())/1000)) : 0;
+    const countdownLeft = room.countdownEndsAt ? Math.max(0, Math.ceil((room.countdownEndsAt - Date.now())/1000)) : 0;
     const playersMarkup = (room.players||[]).map(p=>`<div style="display:flex;justify-content:space-between;gap:10px;padding:8px 10px;border-top:1px solid rgba(255,255,255,0.08);"><span>${escapeHtml(p.name)} ${p.id===room.hostId?`<span class="accent">(${t.host})</span>`:''}</span><span style="opacity:0.72;">${room.started?t.inGame:(p.ready?t.readyStatus:t.unreadyStatus)}</span></div>`).join('');
     $('overlayCard').className='card';
     $('overlayCard').innerHTML = `
       <div class="accent" style="font-size:32px;font-weight:bold;line-height:1.15;margin-bottom:12px;">${escapeHtml(room.roomName)}</div>
       <p style="opacity:0.75;">${t.onlineRoomOwner}: <span class="accent">${escapeHtml(room.hostName)}</span></p>
       <p style="opacity:0.75;">${t.onlinePlayersLabel}: ${room.players.length}/${room.maxPlayers}</p>
-      ${countdownSource&&countdownLeft>0?`<p class="accent" style="font-size:20px;letter-spacing:1px;">${t.autoStarting} ${countdownLeft}</p>`:''}
+      ${room.countdownEndsAt?`<p class="accent" style="font-size:20px;letter-spacing:1px;">${t.autoStarting} ${countdownLeft}</p>`:''}
       <div style="text-align:left;margin:14px 0;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);">${playersMarkup}</div>
       <div class="controls" style="justify-content:center;flex-wrap:wrap;">
         <button id="onlineLeaveBtn">${t.leave}</button>
         <button id="onlineReadyBtn" ${room.started?'disabled':''}>${meReady?t.unready:t.ready}</button>
-        ${isHost?`<button id="onlineStartBtn" ${room.started?'disabled':''}>${t.startMatch}</button>`:''}
+        ${isHost?`<button id="onlineStartBtn" ${room.started||room.countdownEndsAt?'disabled':''}>${t.startMatch}</button>`:''}
       </div>
     `;
     $('overlay').classList.remove('hidden');
@@ -491,7 +536,7 @@
   window.joinOnlineRoom = joinOnlineRoom;
 
   setInterval(()=>{
-    if(state.overlayScreen === 'online-room' && online.roomState && !online.roomState.started && (online.countdownLocalEndsAt || online.roomState.countdownEndsAt)){
+    if(state.overlayScreen === 'online-room' && online.roomState && online.roomState.countdownEndsAt && !online.roomState.started){
       renderOnlineRoom();
     }
   }, 250);
@@ -523,6 +568,7 @@
     online.started = false;
     online.worldSeed = null;
     online.peers = {};
+    onlineSetSpectating(false);
     online.gameMode = 'single';
     return __origGoToMainMenu();
   };
@@ -638,6 +684,12 @@
     state.airdropAnnouncement=Math.max(0,state.airdropAnnouncement-dt);
     localReloadPredict(dt);
 
+    const spectating = online.spectating || !online.selfAlive;
+    if(spectating){
+      mouseDown = false;
+      state.keys.delete('shift');
+    }
+
     let mx=0,my=0;
     if(MOBILE_MODE){
       const mag=Math.hypot(touchState.move.dx,touchState.move.dy);
@@ -650,7 +702,7 @@
       if(state.keys.has('d')||state.keys.has('arrowright'))mx+=1;
       const len=Math.hypot(mx,my)||1; mx/=len; my/=len;
     }
-    if(!MOBILE_MODE && state.keys.has('shift') && player.dashCooldown<=0 && (mx||my)){
+    if(!spectating && !MOBILE_MODE && state.keys.has('shift') && player.dashCooldown<=0 && (mx||my)){
       player.dashCooldown=1.3; player.dashTime=0.18;
       const dashSpeed=460;
       player.dashVX=mx*dashSpeed; player.dashVY=my*dashSpeed;
@@ -668,6 +720,7 @@
       const aimWorldX=camAim.x+state.mouse.x;
       if(aimWorldX<player.x-2) player.faceDir=-1; else if(aimWorldX>player.x+2) player.faceDir=1;
     }
+    if(spectating){ mx = 0; my = 0; }
     if(player.rocketJumpTime>0){
       moveWithWallCollision(player,player.rocketJumpVX*dt,player.rocketJumpVY*dt);
       const rocketJumpDamping=Math.pow(ROCKET_JUMP_DAMPING_PER_SECOND,dt);
@@ -682,7 +735,7 @@
       moveWithWallCollision(player,mx*player.speed*(player.speedMul||1)*dt,my*player.speed*(player.speedMul||1)*dt);
     }
 
-    if((MOBILE_MODE&&touchState.shootHeld)||(!MOBILE_MODE&&mouseDown)){
+    if(!spectating && ((MOBILE_MODE&&touchState.shootHeld)||(!MOBILE_MODE&&mouseDown))){
       if(player.shootCooldown<=0&&player.reloadTimer<=0&&player.mag>0){
         const cam=camera(), worldMouseX=cam.x+state.mouse.x, worldMouseY=cam.y+state.mouse.y;
         const angle=Math.atan2(worldMouseY-player.y,worldMouseX-player.x);
@@ -700,10 +753,12 @@
     online.sendTimer -= dt;
     if(online.sendTimer<=0){
       online.sendTimer = 0.05;
-      onlineSend({
-        type:'player_state',
-        state:{ x:player.x, y:player.y, faceDir:player.faceDir, moving:!!(mx||my||mouseDown||touchState.shootHeld), name:state.playerName }
-      });
+      if(!spectating){
+        onlineSend({
+          type:'player_state',
+          state:{ x:player.x, y:player.y, faceDir:player.faceDir, moving:!!(mx||my||mouseDown||touchState.shootHeld), name:state.playerName }
+        });
+      }
     }
   }
 
@@ -713,9 +768,29 @@
     return __origUpdate(dt);
   };
 
+  const __origCamera = camera;
+  camera = function(){
+    if(online.connected && online.started && onlineIsMode() && online.spectating){
+      const target = onlineSpectateTarget();
+      if(target){
+        const shakeX = state.cameraShake>0?rand(-state.cameraShake,state.cameraShake):0;
+        const shakeY = state.cameraShake>0?rand(-state.cameraShake,state.cameraShake):0;
+        return {x:clamp((target.x||0)-SW/2+shakeX,0,WORLD.w-SW),y:clamp((target.y||0)-SH/2+shakeY,0,WORLD.h-SH)};
+      }
+    }
+    return __origCamera();
+  };
+
+  const __origDrawCrosshair = drawCrosshair;
+  drawCrosshair = function(){
+    if(online.connected && online.started && onlineIsMode() && online.spectating) return;
+    return __origDrawCrosshair();
+  };
+
   const __origThrowThrowable = throwThrowable;
   throwThrowable = function(kind='grenade'){
     if(!(online.connected && online.started && state.running && onlineIsMode())) return __origThrowThrowable(kind);
+    if(online.spectating || !online.selfAlive) return;
     const isMolotov=kind==='molotov';
     if(isMolotov&&player.molotovs<=0)return;
     if(!isMolotov&&player.grenades<=0)return;
@@ -732,6 +807,7 @@
   const __origStartReload = startReload;
   startReload = function(){
     const before = player.reloadTimer;
+    if(online.connected && online.started && state.running && onlineIsMode() && (online.spectating || !online.selfAlive)) return;
     __origStartReload();
     if(online.connected && online.started && state.running && onlineIsMode() && player.reloadTimer>0 && before===0){
       onlineSendAction({ kind:'reload' });
@@ -752,17 +828,29 @@
     ctx.fillText(`${ot().onlinePreview}`, 20, SH-42);
     ctx.fillStyle='#f0e6d8';
     ctx.fillText(`${ot().peers}: ${Object.keys(online.peers).length}`, 20, SH-24);
+    if(online.spectating){
+      const target = onlineSpectateTarget();
+      const label = target ? `${lang==='zh' ? '正在观战' : 'SPECTATING'}: ${target.name || 'Player'}` : (lang==='zh' ? '你已倒下，等待队友。' : 'You are down. Waiting on your teammate.');
+      ctx.textAlign='center';
+      ctx.font='bold 18px Courier New';
+      ctx.fillStyle='rgba(0,0,0,0.55)';
+      ctx.fillRect(Math.round(SW*0.5-180), 18, 360, 34);
+      ctx.fillStyle='#f0d39c';
+      ctx.fillText(label, Math.round(SW*0.5), 40);
+    }
   };
 
   function drawRemotePlayer(peer, cam){
     const s = worldToScreen(peer.x||0, peer.y||0, cam), x=Math.round(s.x), y=Math.round(s.y);
     const facing = (peer.faceDir||1) < 0 ? -1 : 1;
-    const body = '#6ca9ff';
-    const shirt = '#2c5d8f';
+    const dead = peer.alive === false || (peer.hp||0) <= 0;
+    const body = dead ? '#6a6a6a' : '#6ca9ff';
+    const shirt = dead ? '#3f3f3f' : '#2c5d8f';
     pxRect(x-6,y-8,12,10,'#bca18f');
     pxRect(x-7,y+2,14,10,shirt);
     pxRect(x-7,y+12,4,6,'#242424');
     pxRect(x+3,y+12,4,6,'#242424');
+    ctx.globalAlpha = dead ? 0.65 : 1;
     ctx.fillStyle='rgba(0,0,0,0.28)';
     ctx.fillRect(x-10,y+18,20,4);
     drawRotatedGun(x+(facing>0?5:-5), y+5, facing>0?0:Math.PI, body, '#d6b07a', peer.weapon||'shotgun');
@@ -774,6 +862,7 @@
     ctx.fillText(String(peer.name||'Player'), x, y-13);
     const barW=22, ratio=Math.max(0,Math.min(1,(peer.hp||0)/(peer.maxHp||100)));
     pxRect(x-barW/2,y-28,barW,4,'rgba(255,255,255,0.12)');
-    pxRect(x-barW/2,y-28,barW*ratio,4,'#59c36a');
+    pxRect(x-barW/2,y-28,barW*ratio,4,dead?'#7f6d6d':'#59c36a');
+    ctx.globalAlpha = 1;
   }
 })();
