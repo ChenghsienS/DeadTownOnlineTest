@@ -390,7 +390,6 @@ function roomPublicState(room) {
     playerCount: room.players.size,
     started: room.started,
     countdownEndsAt: room.countdownEndsAt,
-    countdownMsLeft: room.countdownEndsAt ? Math.max(0, room.countdownEndsAt - Date.now()) : null,
     players,
   };
 }
@@ -486,12 +485,13 @@ function maybeStartCountdown(room) {
     return;
   }
   const everyoneReady = Array.from(room.players.values()).every((client) => client.ready);
-  room.countdownEndsAt = everyoneReady ? Date.now() + 5000 : null;
+  room.countdownEndsAt = everyoneReady ? Date.now() + 3000 : null;
 }
 function canStartMatch(room, requesterId) {
   if (room.started) return false;
+  if (room.hostId !== requesterId) return false;
   if (room.players.size < 1) return false;
-  return room.players.has(requesterId);
+  return Array.from(room.players.values()).every((client) => client.ready || client.id === requesterId);
 }
 function currentPlayers(room) {
   return Array.from(room.match.playersById.values());
@@ -574,10 +574,15 @@ function addScore(player, value) {
 }
 function damagePlayerServer(room, player, amount) {
   if (!player || !player.alive || player.hp <= 0) return;
+  const wasAlive = player.alive && player.hp > 0;
   player.hp = Math.max(0, player.hp - amount);
   if (player.hp <= 0) {
     player.hp = 0;
     player.alive = false;
+    if (wasAlive) {
+      const clientRef = clients.get(player.id);
+      broadcastToRoom(room, { type: 'player_down', playerId: player.id, name: clientRef?.name || player.name || 'Player' });
+    }
   }
 }
 function awardSerum(player, buff) {
@@ -1233,7 +1238,7 @@ wss.on('connection', (ws) => {
       const room = rooms.get(client.roomId);
       if (!room) return;
       if (!canStartMatch(room, client.id)) {
-        safeSend(ws, { type: 'error', message: 'Only players in the room can start the match.' });
+        safeSend(ws, { type: 'error', message: 'Only the host can start when everyone is ready.' });
         return;
       }
       startMatch(room);
